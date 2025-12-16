@@ -1,0 +1,326 @@
+// Prisma schema for Marketplace Orchestrator
+// Multi-vendor e-commerce platform
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Vendor management
+model Vendor {
+  id                String    @id @default(cuid())
+  email             String    @unique
+  name              String
+  slug              String    @unique
+  description       String?
+  logo              String?
+  stripeAccountId   String?   @unique
+  stripeOnboarded   Boolean   @default(false)
+  commissionRate    Decimal   @default(0.10) @db.Decimal(5, 4)
+  reputationScore   Decimal   @default(5.0) @db.Decimal(3, 2)
+  status            VendorStatus @default(PENDING)
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  products          Product[]
+  orders            OrderItem[]
+  payouts           Payout[]
+  disputes          Dispute[]
+  inventoryAlerts   InventoryAlert[]
+
+  @@index([status])
+  @@index([stripeAccountId])
+}
+
+enum VendorStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  DEACTIVATED
+}
+
+// Product catalog
+model Product {
+  id                String    @id @default(cuid())
+  vendorId          String
+  vendor            Vendor    @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  sku               String
+  name              String
+  description       String?
+  basePrice         Decimal   @db.Decimal(10, 2)
+  currentPrice      Decimal   @db.Decimal(10, 2)
+  costPrice         Decimal?  @db.Decimal(10, 2)
+  category          String
+  subcategory       String?
+  images            String[]
+  attributes        Json      @default("{}")
+  status            ProductStatus @default(DRAFT)
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  inventory         Inventory?
+  pricingRules      PricingRule[]
+  orderItems        OrderItem[]
+  comparisons       ProductComparison[]
+
+  @@unique([vendorId, sku])
+  @@index([category])
+  @@index([status])
+  @@index([currentPrice])
+}
+
+enum ProductStatus {
+  DRAFT
+  ACTIVE
+  OUT_OF_STOCK
+  DISCONTINUED
+}
+
+// Inventory management
+model Inventory {
+  id                String    @id @default(cuid())
+  productId         String    @unique
+  product           Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  quantity          Int       @default(0)
+  reservedQuantity  Int       @default(0)
+  lowStockThreshold Int       @default(10)
+  reorderPoint      Int       @default(5)
+  reorderQuantity   Int       @default(50)
+  autoReorder       Boolean   @default(false)
+  lastSyncedAt      DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  alerts            InventoryAlert[]
+
+  @@index([quantity])
+}
+
+model InventoryAlert {
+  id                String    @id @default(cuid())
+  inventoryId       String
+  inventory         Inventory @relation(fields: [inventoryId], references: [id], onDelete: Cascade)
+  vendorId          String
+  vendor            Vendor    @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  type              AlertType
+  message           String
+  resolved          Boolean   @default(false)
+  createdAt         DateTime  @default(now())
+  resolvedAt        DateTime?
+
+  @@index([vendorId, resolved])
+  @@index([type])
+}
+
+enum AlertType {
+  LOW_STOCK
+  OUT_OF_STOCK
+  REORDER_TRIGGERED
+  SYNC_FAILED
+}
+
+// Dynamic pricing
+model PricingRule {
+  id                String    @id @default(cuid())
+  productId         String?
+  product           Product?  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  name              String
+  description       String?
+  ruleType          PricingRuleType
+  conditions        Json      @default("{}")
+  adjustment        Json      // { type: 'percentage' | 'fixed', value: number }
+  priority          Int       @default(0)
+  isActive          Boolean   @default(true)
+  startDate         DateTime?
+  endDate           DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@index([ruleType, isActive])
+  @@index([productId])
+}
+
+enum PricingRuleType {
+  INVENTORY_BASED
+  DEMAND_BASED
+  TIME_BASED
+  COMPETITOR_BASED
+  BULK_DISCOUNT
+  PROMOTIONAL
+}
+
+// Orders and payments
+model Order {
+  id                String    @id @default(cuid())
+  customerId        String
+  customer          Customer  @relation(fields: [customerId], references: [id])
+  status            OrderStatus @default(PENDING)
+  subtotal          Decimal   @db.Decimal(10, 2)
+  platformFee       Decimal   @db.Decimal(10, 2)
+  total             Decimal   @db.Decimal(10, 2)
+  stripePaymentId   String?   @unique
+  shippingAddress   Json
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  items             OrderItem[]
+  escrowPayments    EscrowPayment[]
+
+  @@index([customerId])
+  @@index([status])
+}
+
+enum OrderStatus {
+  PENDING
+  PAID
+  PROCESSING
+  SHIPPED
+  DELIVERED
+  CANCELLED
+  REFUNDED
+}
+
+model OrderItem {
+  id                String    @id @default(cuid())
+  orderId           String
+  order             Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId         String
+  product           Product   @relation(fields: [productId], references: [id])
+  vendorId          String
+  vendor            Vendor    @relation(fields: [vendorId], references: [id])
+  quantity          Int
+  unitPrice         Decimal   @db.Decimal(10, 2)
+  subtotal          Decimal   @db.Decimal(10, 2)
+  commission        Decimal   @db.Decimal(10, 2)
+  vendorPayout      Decimal   @db.Decimal(10, 2)
+  status            OrderItemStatus @default(PENDING)
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  disputes          Dispute[]
+
+  @@index([vendorId])
+  @@index([status])
+}
+
+enum OrderItemStatus {
+  PENDING
+  CONFIRMED
+  SHIPPED
+  DELIVERED
+  DISPUTED
+  REFUNDED
+}
+
+// Customer
+model Customer {
+  id                String    @id @default(cuid())
+  email             String    @unique
+  name              String
+  stripeCustomerId  String?   @unique
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  orders            Order[]
+  disputes          Dispute[]
+  comparisons       ProductComparison[]
+}
+
+// Payments and payouts
+model EscrowPayment {
+  id                String    @id @default(cuid())
+  orderId           String
+  order             Order     @relation(fields: [orderId], references: [id])
+  amount            Decimal   @db.Decimal(10, 2)
+  status            EscrowStatus @default(HELD)
+  releasedAt        DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@index([status])
+}
+
+enum EscrowStatus {
+  HELD
+  RELEASED
+  REFUNDED
+  DISPUTED
+}
+
+model Payout {
+  id                String    @id @default(cuid())
+  vendorId          String
+  vendor            Vendor    @relation(fields: [vendorId], references: [id])
+  amount            Decimal   @db.Decimal(10, 2)
+  stripeTransferId  String?   @unique
+  status            PayoutStatus @default(PENDING)
+  createdAt         DateTime  @default(now())
+  processedAt       DateTime?
+
+  @@index([vendorId])
+  @@index([status])
+}
+
+enum PayoutStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+// Dispute resolution
+model Dispute {
+  id                String    @id @default(cuid())
+  orderItemId       String
+  orderItem         OrderItem @relation(fields: [orderItemId], references: [id])
+  customerId        String
+  customer          Customer  @relation(fields: [customerId], references: [id])
+  vendorId          String
+  vendor            Vendor    @relation(fields: [vendorId], references: [id])
+  reason            DisputeReason
+  description       String
+  evidence          Json      @default("[]")
+  status            DisputeStatus @default(OPEN)
+  resolution        String?
+  refundAmount      Decimal?  @db.Decimal(10, 2)
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  resolvedAt        DateTime?
+
+  @@index([status])
+  @@index([vendorId])
+}
+
+enum DisputeReason {
+  NOT_RECEIVED
+  NOT_AS_DESCRIBED
+  DAMAGED
+  WRONG_ITEM
+  OTHER
+}
+
+enum DisputeStatus {
+  OPEN
+  UNDER_REVIEW
+  RESOLVED_CUSTOMER
+  RESOLVED_VENDOR
+  ESCALATED
+  CLOSED
+}
+
+// Product comparison
+model ProductComparison {
+  id                String    @id @default(cuid())
+  customerId        String?
+  customer          Customer? @relation(fields: [customerId], references: [id])
+  sessionId         String?
+  productId         String
+  product           Product   @relation(fields: [productId], references: [id])
+  createdAt         DateTime  @default(now())
+
+  @@index([customerId])
+  @@index([sessionId])
+}
