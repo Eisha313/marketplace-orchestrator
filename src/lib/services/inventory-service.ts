@@ -1,4 +1,4 @@
-import { prisma } from '@/lib/db';
+import { db } from '../db';
 import { EventEmitter } from 'events';
 
 export interface InventoryItem {
@@ -11,350 +11,403 @@ export interface InventoryItem {
   lowStockThreshold: number;
   reorderPoint: number;
   reorderQuantity: number;
-  lastSyncedAt: Date;
   warehouseLocation?: string;
+  lastSyncedAt: Date;
+  version: number;
 }
 
-export interface InventoryUpdate {
-  productId: string;
-  vendorId: string;
-  quantityChange: number;
-  reason: 'sale' | 'restock' | 'adjustment' | 'return' | 'reservation';
-  referenceId?: string;
+export interface StockAlert {
+  id: string;
+  inventoryId: string;
+  type: 'LOW_STOCK' | 'OUT_OF_STOCK' | 'REORDER_TRIGGERED';
+  message: string;
+  acknowledged: boolean;
+  createdAt: Date;
 }
 
-export interface LowStockAlert {
-  productId: string;
-  vendorId: string;
-  currentQuantity: number;
-  threshold: number;
-  sku: string;
-  productName: string;
+export interface SyncResult {
+  success: boolean;
+  itemsProcessed: number;
+  errors: SyncError[];
+  timestamp: Date;
 }
 
-class InventoryEventEmitter extends EventEmitter {
-  emitLowStock(alert: LowStockAlert) {
-    this.emit('lowStock', alert);
-  }
+export interface SyncError {
+  inventoryId: string;
+  error: string;
+  retryable: boolean;
+}
 
-  emitInventoryUpdate(update: InventoryItem) {
-    this.emit('inventoryUpdate', update);
-  }
-
-  emitReorderTriggered(item: InventoryItem) {
-    this.emit('reorderTriggered', item);
+class InventoryServiceError extends Error {
+  constructor(
+    message: string,
+    public code: string,
+    public retryable: boolean = false
+  ) {
+    super(message);
+    this.name = 'InventoryServiceError';
   }
 }
 
-export const inventoryEvents = new InventoryEventEmitter();
+const inventoryEvents = new EventEmitter();
 
-export class InventoryService {
-  private syncInProgress: Map<string, boolean> = new Map();
+// Lock management for preventing race conditions
+const activeLocks = new Map<string, { timestamp: number; promise: Promise<void> }>();
+const LOCK_TIMEOUT_MS = 30000; // 30 seconds
 
-  async getInventory(productId: string, vendorId: string): Promise<InventoryItem | null> {
-    const inventory = await prisma.inventory.findUnique({
-      where: {
-        productId_vendorId: {
-          productId,
-          vendorId,
-        },
-      },
-    });
-
-    return inventory;
+async function acquireLock(key: string): Promise<() => void> {
+  const existingLock = activeLocks.get(key);
+  
+  if (existingLock) {
+    // Check if lock is stale
+    if (Date.now() - existingLock.timestamp > LOCK_TIMEOUT_MS) {
+      activeLocks.delete(key);
+    } else {
+      // Wait for existing lock to release
+      await existingLock.promise;
+    }
   }
+  
+  let releaseFn: () => void;
+  const lockPromise = new Promise<void>((resolve) => {
+    releaseFn = resolve;
+  });
+  
+  activeLocks.set(key, { timestamp: Date.now(), promise: lockPromise });
+  
+  return () => {
+    activeLocks.delete(key);
+    releaseFn!();
+  };
+}
 
-  async getVendorInventory(vendorId: string): Promise<InventoryItem[]> {
-    const inventory = await prisma.inventory.findMany({
+export async function getInventoryByVendor(vendorId: string): Promise<InventoryItem[]> {
+  try {
+    const inventory = await db.inventory.findMany({
       where: { vendorId },
       include: {
-        product: {
-          select: {
-            name: true,
-            category: true,
-          },
-        },
+        product: true,
       },
     });
 
-    return inventory;
-  }
-
-  async getAvailableQuantity(productId: string, vendorId: string): Promise<number> {
-    const inventory = await this.getInventory(productId, vendorId);
-    if (!inventory) return 0;
-    return Math.max(0, inventory.quantity - inventory.reservedQuantity);
-  }
-
-  async updateInventory(update: InventoryUpdate): Promise<InventoryItem> {
-    const { productId, vendorId, quantityChange, reason, referenceId } = update;
-
-    const result = await prisma.$transaction(async (tx) => {
-      const current = await tx.inventory.findUnique({
-        where: {
-          productId_vendorId: { productId, vendorId },
-        },
-      });
-
-      if (!current) {
-        throw new Error(`Inventory not found for product ${productId} and vendor ${vendorId}`);
-      }
-
-      const newQuantity = current.quantity + quantityChange;
-      if (newQuantity < 0) {
-        throw new Error('Insufficient inventory');
-      }
-
-      const updated = await tx.inventory.update({
-        where: {
-          productId_vendorId: { productId, vendorId },
-        },
-        data: {
-          quantity: newQuantity,
-          lastSyncedAt: new Date(),
-        },
-      });
-
-      await tx.inventoryLog.create({
-        data: {
-          inventoryId: updated.id,
-          previousQuantity: current.quantity,
-          newQuantity,
-          quantityChange,
-          reason,
-          referenceId,
-        },
-      });
-
-      return updated;
-    });
-
-    inventoryEvents.emitInventoryUpdate(result);
-
-    if (result.quantity <= result.lowStockThreshold) {
-      const product = await prisma.product.findUnique({
-        where: { id: productId },
-        select: { name: true },
-      });
-
-      inventoryEvents.emitLowStock({
-        productId,
-        vendorId,
-        currentQuantity: result.quantity,
-        threshold: result.lowStockThreshold,
-        sku: result.sku,
-        productName: product?.name || 'Unknown',
-      });
-    }
-
-    if (result.quantity <= result.reorderPoint) {
-      await this.triggerReorder(result);
-    }
-
-    return result;
-  }
-
-  async reserveInventory(
-    productId: string,
-    vendorId: string,
-    quantity: number,
-    orderId: string
-  ): Promise<boolean> {
-    const available = await this.getAvailableQuantity(productId, vendorId);
-    if (available < quantity) {
-      return false;
-    }
-
-    await prisma.$transaction(async (tx) => {
-      await tx.inventory.update({
-        where: {
-          productId_vendorId: { productId, vendorId },
-        },
-        data: {
-          reservedQuantity: { increment: quantity },
-        },
-      });
-
-      await tx.inventoryReservation.create({
-        data: {
-          productId,
-          vendorId,
-          orderId,
-          quantity,
-          expiresAt: new Date(Date.now() + 30 * 60 * 1000), // 30 minutes
-        },
-      });
-    });
-
-    return true;
-  }
-
-  async releaseReservation(orderId: string): Promise<void> {
-    const reservations = await prisma.inventoryReservation.findMany({
-      where: { orderId, status: 'active' },
-    });
-
-    await prisma.$transaction(async (tx) => {
-      for (const reservation of reservations) {
-        await tx.inventory.update({
-          where: {
-            productId_vendorId: {
-              productId: reservation.productId,
-              vendorId: reservation.vendorId,
-            },
-          },
-          data: {
-            reservedQuantity: { decrement: reservation.quantity },
-          },
-        });
-
-        await tx.inventoryReservation.update({
-          where: { id: reservation.id },
-          data: { status: 'released' },
-        });
-      }
-    });
-  }
-
-  async confirmReservation(orderId: string): Promise<void> {
-    const reservations = await prisma.inventoryReservation.findMany({
-      where: { orderId, status: 'active' },
-    });
-
-    await prisma.$transaction(async (tx) => {
-      for (const reservation of reservations) {
-        await tx.inventory.update({
-          where: {
-            productId_vendorId: {
-              productId: reservation.productId,
-              vendorId: reservation.vendorId,
-            },
-          },
-          data: {
-            quantity: { decrement: reservation.quantity },
-            reservedQuantity: { decrement: reservation.quantity },
-          },
-        });
-
-        await tx.inventoryReservation.update({
-          where: { id: reservation.id },
-          data: { status: 'confirmed' },
-        });
-
-        await tx.inventoryLog.create({
-          data: {
-            inventoryId: reservation.id,
-            previousQuantity: 0,
-            newQuantity: 0,
-            quantityChange: -reservation.quantity,
-            reason: 'sale',
-            referenceId: orderId,
-          },
-        });
-      }
-    });
-  }
-
-  async syncVendorInventory(vendorId: string, externalInventory: InventoryItem[]): Promise<void> {
-    const syncKey = `sync_${vendorId}`;
-    if (this.syncInProgress.get(syncKey)) {
-      throw new Error('Sync already in progress for this vendor');
-    }
-
-    this.syncInProgress.set(syncKey, true);
-
-    try {
-      for (const item of externalInventory) {
-        await prisma.inventory.upsert({
-          where: {
-            productId_vendorId: {
-              productId: item.productId,
-              vendorId: item.vendorId,
-            },
-          },
-          update: {
-            quantity: item.quantity,
-            lastSyncedAt: new Date(),
-          },
-          create: {
-            ...item,
-            lastSyncedAt: new Date(),
-          },
-        });
-      }
-    } finally {
-      this.syncInProgress.set(syncKey, false);
-    }
-  }
-
-  async getLowStockItems(vendorId?: string): Promise<LowStockAlert[]> {
-    const where: any = {};
-    if (vendorId) {
-      where.vendorId = vendorId;
-    }
-
-    const items = await prisma.inventory.findMany({
-      where: {
-        ...where,
-        quantity: {
-          lte: prisma.inventory.fields.lowStockThreshold,
-        },
-      },
-      include: {
-        product: {
-          select: { name: true },
-        },
-      },
-    });
-
-    return items.map((item) => ({
+    return inventory.map(item => ({
+      id: item.id,
       productId: item.productId,
       vendorId: item.vendorId,
-      currentQuantity: item.quantity,
-      threshold: item.lowStockThreshold,
       sku: item.sku,
-      productName: item.product?.name || 'Unknown',
+      quantity: item.quantity,
+      reservedQuantity: item.reservedQuantity,
+      lowStockThreshold: item.lowStockThreshold,
+      reorderPoint: item.reorderPoint,
+      reorderQuantity: item.reorderQuantity,
+      warehouseLocation: item.warehouseLocation ?? undefined,
+      lastSyncedAt: item.lastSyncedAt,
+      version: item.version,
     }));
-  }
-
-  private async triggerReorder(item: InventoryItem): Promise<void> {
-    const existingReorder = await prisma.reorderRequest.findFirst({
-      where: {
-        inventoryId: item.id,
-        status: 'pending',
-      },
-    });
-
-    if (existingReorder) {
-      return;
-    }
-
-    await prisma.reorderRequest.create({
-      data: {
-        inventoryId: item.id,
-        vendorId: item.vendorId,
-        quantity: item.reorderQuantity,
-        status: 'pending',
-      },
-    });
-
-    inventoryEvents.emitReorderTriggered(item);
-  }
-
-  async cleanupExpiredReservations(): Promise<number> {
-    const expired = await prisma.inventoryReservation.findMany({
-      where: {
-        status: 'active',
-        expiresAt: { lt: new Date() },
-      },
-    });
-
-    for (const reservation of expired) {
-      await this.releaseReservation(reservation.orderId);
-    }
-
-    return expired.length;
+  } catch (error) {
+    throw new InventoryServiceError(
+      `Failed to fetch inventory for vendor ${vendorId}`,
+      'FETCH_FAILED',
+      true
+    );
   }
 }
 
-export const inventoryService = new InventoryService();
+export async function updateInventoryQuantity(
+  inventoryId: string,
+  quantityChange: number,
+  expectedVersion?: number
+): Promise<InventoryItem> {
+  const lockKey = `inventory:${inventoryId}`;
+  const releaseLock = await acquireLock(lockKey);
+  
+  try {
+    // Use optimistic locking to prevent race conditions
+    const currentItem = await db.inventory.findUnique({
+      where: { id: inventoryId },
+    });
+
+    if (!currentItem) {
+      throw new InventoryServiceError(
+        `Inventory item ${inventoryId} not found`,
+        'NOT_FOUND',
+        false
+      );
+    }
+
+    // Check version for optimistic locking
+    if (expectedVersion !== undefined && currentItem.version !== expectedVersion) {
+      throw new InventoryServiceError(
+        `Version conflict for inventory ${inventoryId}. Expected ${expectedVersion}, got ${currentItem.version}`,
+        'VERSION_CONFLICT',
+        true
+      );
+    }
+
+    const newQuantity = currentItem.quantity + quantityChange;
+
+    if (newQuantity < 0) {
+      throw new InventoryServiceError(
+        `Insufficient stock. Available: ${currentItem.quantity}, Requested: ${Math.abs(quantityChange)}`,
+        'INSUFFICIENT_STOCK',
+        false
+      );
+    }
+
+    const updated = await db.inventory.update({
+      where: { 
+        id: inventoryId,
+        version: currentItem.version, // Ensure version hasn't changed
+      },
+      data: {
+        quantity: newQuantity,
+        lastSyncedAt: new Date(),
+        version: { increment: 1 },
+      },
+    });
+
+    // Check for low stock and trigger alerts
+    if (newQuantity <= updated.lowStockThreshold) {
+      await createStockAlert(inventoryId, newQuantity === 0 ? 'OUT_OF_STOCK' : 'LOW_STOCK');
+    }
+
+    // Check if reorder should be triggered
+    if (newQuantity <= updated.reorderPoint) {
+      await triggerReorder(updated);
+    }
+
+    inventoryEvents.emit('inventoryUpdated', {
+      inventoryId,
+      vendorId: updated.vendorId,
+      previousQuantity: currentItem.quantity,
+      newQuantity,
+      timestamp: new Date(),
+    });
+
+    return {
+      id: updated.id,
+      productId: updated.productId,
+      vendorId: updated.vendorId,
+      sku: updated.sku,
+      quantity: updated.quantity,
+      reservedQuantity: updated.reservedQuantity,
+      lowStockThreshold: updated.lowStockThreshold,
+      reorderPoint: updated.reorderPoint,
+      reorderQuantity: updated.reorderQuantity,
+      warehouseLocation: updated.warehouseLocation ?? undefined,
+      lastSyncedAt: updated.lastSyncedAt,
+      version: updated.version,
+    };
+  } finally {
+    releaseLock();
+  }
+}
+
+export async function reserveInventory(
+  inventoryId: string,
+  quantity: number
+): Promise<{ success: boolean; reservationId: string }> {
+  const lockKey = `inventory:${inventoryId}`;
+  const releaseLock = await acquireLock(lockKey);
+  
+  try {
+    const item = await db.inventory.findUnique({
+      where: { id: inventoryId },
+    });
+
+    if (!item) {
+      throw new InventoryServiceError(
+        `Inventory item ${inventoryId} not found`,
+        'NOT_FOUND',
+        false
+      );
+    }
+
+    const availableQuantity = item.quantity - item.reservedQuantity;
+
+    if (availableQuantity < quantity) {
+      throw new InventoryServiceError(
+        `Insufficient available stock. Available: ${availableQuantity}, Requested: ${quantity}`,
+        'INSUFFICIENT_STOCK',
+        false
+      );
+    }
+
+    const reservation = await db.$transaction(async (tx) => {
+      await tx.inventory.update({
+        where: { id: inventoryId },
+        data: {
+          reservedQuantity: { increment: quantity },
+          version: { increment: 1 },
+        },
+      });
+
+      return tx.inventoryReservation.create({
+        data: {
+          inventoryId,
+          quantity,
+          status: 'ACTIVE',
+          expiresAt: new Date(Date.now() + 15 * 60 * 1000), // 15 minutes
+        },
+      });
+    });
+
+    return {
+      success: true,
+      reservationId: reservation.id,
+    };
+  } finally {
+    releaseLock();
+  }
+}
+
+export async function releaseReservation(reservationId: string): Promise<void> {
+  const reservation = await db.inventoryReservation.findUnique({
+    where: { id: reservationId },
+  });
+
+  if (!reservation) {
+    throw new InventoryServiceError(
+      `Reservation ${reservationId} not found`,
+      'NOT_FOUND',
+      false
+    );
+  }
+
+  const lockKey = `inventory:${reservation.inventoryId}`;
+  const releaseLock = await acquireLock(lockKey);
+
+  try {
+    await db.$transaction(async (tx) => {
+      await tx.inventory.update({
+        where: { id: reservation.inventoryId },
+        data: {
+          reservedQuantity: { decrement: reservation.quantity },
+          version: { increment: 1 },
+        },
+      });
+
+      await tx.inventoryReservation.update({
+        where: { id: reservationId },
+        data: { status: 'RELEASED' },
+      });
+    });
+  } finally {
+    releaseLock();
+  }
+}
+
+async function createStockAlert(
+  inventoryId: string,
+  type: 'LOW_STOCK' | 'OUT_OF_STOCK' | 'REORDER_TRIGGERED'
+): Promise<void> {
+  const item = await db.inventory.findUnique({
+    where: { id: inventoryId },
+    include: { product: true },
+  });
+
+  if (!item) return;
+
+  const messages = {
+    LOW_STOCK: `Low stock alert: ${item.product.name} (SKU: ${item.sku}) has only ${item.quantity} units remaining`,
+    OUT_OF_STOCK: `Out of stock: ${item.product.name} (SKU: ${item.sku}) is now out of stock`,
+    REORDER_TRIGGERED: `Reorder triggered: ${item.product.name} (SKU: ${item.sku}) - ordering ${item.reorderQuantity} units`,
+  };
+
+  await db.stockAlert.create({
+    data: {
+      inventoryId,
+      vendorId: item.vendorId,
+      type,
+      message: messages[type],
+      acknowledged: false,
+    },
+  });
+
+  inventoryEvents.emit('stockAlert', {
+    inventoryId,
+    vendorId: item.vendorId,
+    type,
+    message: messages[type],
+    timestamp: new Date(),
+  });
+}
+
+async function triggerReorder(item: any): Promise<void> {
+  // Check if there's already a pending reorder
+  const existingReorder = await db.reorderRequest.findFirst({
+    where: {
+      inventoryId: item.id,
+      status: 'PENDING',
+    },
+  });
+
+  if (existingReorder) return;
+
+  await db.reorderRequest.create({
+    data: {
+      inventoryId: item.id,
+      vendorId: item.vendorId,
+      quantity: item.reorderQuantity,
+      status: 'PENDING',
+    },
+  });
+
+  await createStockAlert(item.id, 'REORDER_TRIGGERED');
+}
+
+export async function syncVendorInventory(vendorId: string): Promise<SyncResult> {
+  const errors: SyncError[] = [];
+  let itemsProcessed = 0;
+
+  try {
+    const inventoryItems = await db.inventory.findMany({
+      where: { vendorId },
+    });
+
+    for (const item of inventoryItems) {
+      try {
+        await db.inventory.update({
+          where: { id: item.id },
+          data: {
+            lastSyncedAt: new Date(),
+          },
+        });
+        itemsProcessed++;
+      } catch (error) {
+        errors.push({
+          inventoryId: item.id,
+          error: error instanceof Error ? error.message : 'Unknown error',
+          retryable: true,
+        });
+      }
+    }
+
+    return {
+      success: errors.length === 0,
+      itemsProcessed,
+      errors,
+      timestamp: new Date(),
+    };
+  } catch (error) {
+    throw new InventoryServiceError(
+      `Failed to sync inventory for vendor ${vendorId}`,
+      'SYNC_FAILED',
+      true
+    );
+  }
+}
+
+export function onInventoryUpdate(
+  callback: (event: any) => void
+): () => void {
+  inventoryEvents.on('inventoryUpdated', callback);
+  return () => inventoryEvents.off('inventoryUpdated', callback);
+}
+
+export function onStockAlert(
+  callback: (event: any) => void
+): () => void {
+  inventoryEvents.on('stockAlert', callback);
+  return () => inventoryEvents.off('stockAlert', callback);
+}
