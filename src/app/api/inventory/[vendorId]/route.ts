@@ -1,202 +1,143 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest } from 'next/server';
+import { InventoryService } from '@/lib/services/inventory-service';
 import {
-  getInventoryByVendor,
-  updateInventoryQuantity,
-  reserveInventory,
-  releaseReservation,
-  syncVendorInventory,
-} from '@/lib/services/inventory-service';
+  ApiResponseBuilder,
+  handleApiError,
+  validateRequiredFields,
+  parseQueryParams,
+} from '@/lib/utils/api-response';
 
-interface RouteParams {
-  params: { vendorId: string };
-}
+const inventoryService = new InventoryService();
 
 export async function GET(
   request: NextRequest,
-  { params }: RouteParams
-): Promise<NextResponse> {
+  { params }: { params: { vendorId: string } }
+) {
   try {
     const { vendorId } = params;
 
     if (!vendorId) {
-      return NextResponse.json(
-        { error: 'Vendor ID is required' },
-        { status: 400 }
-      );
+      return ApiResponseBuilder.badRequest('Vendor ID is required');
     }
 
-    const inventory = await getInventoryByVendor(vendorId);
+    const { page, limit, sortBy, sortOrder, filters } = parseQueryParams(
+      request.nextUrl.searchParams
+    );
 
-    return NextResponse.json({
-      success: true,
-      data: inventory,
-      timestamp: new Date().toISOString(),
+    const result = await inventoryService.getVendorInventory(vendorId, {
+      page,
+      limit,
+      sortBy: sortBy || 'updatedAt',
+      sortOrder,
+      lowStockOnly: filters.lowStockOnly === 'true',
+      category: filters.category,
+      search: filters.search,
+    });
+
+    return ApiResponseBuilder.success(result.items, {
+      page,
+      limit,
+      total: result.total,
+      hasMore: page * limit < result.total,
     });
   } catch (error) {
-    console.error('Error fetching inventory:', error);
-    
-    const isRetryable = error instanceof Error && 
-      'retryable' in error && 
-      (error as any).retryable;
-
-    return NextResponse.json(
-      {
-        success: false,
-        error: error instanceof Error ? error.message : 'Failed to fetch inventory',
-        retryable: isRetryable,
-      },
-      { status: isRetryable ? 503 : 500 }
-    );
-  }
-}
-
-export async function PATCH(
-  request: NextRequest,
-  { params }: RouteParams
-): Promise<NextResponse> {
-  try {
-    const { vendorId } = params;
-    const body = await request.json();
-    const { inventoryId, quantityChange, expectedVersion, action } = body;
-
-    if (!vendorId) {
-      return NextResponse.json(
-        { error: 'Vendor ID is required' },
-        { status: 400 }
-      );
-    }
-
-    if (action === 'reserve') {
-      if (!inventoryId || typeof body.quantity !== 'number') {
-        return NextResponse.json(
-          { error: 'Inventory ID and quantity are required for reservation' },
-          { status: 400 }
-        );
-      }
-
-      const result = await reserveInventory(inventoryId, body.quantity);
-      return NextResponse.json({
-        success: true,
-        data: result,
-        timestamp: new Date().toISOString(),
-      });
-    }
-
-    if (action === 'release') {
-      if (!body.reservationId) {
-        return NextResponse.json(
-          { error: 'Reservation ID is required' },
-          { status: 400 }
-        );
-      }
-
-      await releaseReservation(body.reservationId);
-      return NextResponse.json({
-        success: true,
-        message: 'Reservation released successfully',
-        timestamp: new Date().toISOString(),
-      });
-    }
-
-    if (action === 'update') {
-      if (!inventoryId || typeof quantityChange !== 'number') {
-        return NextResponse.json(
-          { error: 'Inventory ID and quantity change are required' },
-          { status: 400 }
-        );
-      }
-
-      const updated = await updateInventoryQuantity(
-        inventoryId,
-        quantityChange,
-        expectedVersion
-      );
-
-      return NextResponse.json({
-        success: true,
-        data: updated,
-        timestamp: new Date().toISOString(),
-      });
-    }
-
-    return NextResponse.json(
-      { error: 'Invalid action. Use: update, reserve, or release' },
-      { status: 400 }
-    );
-  } catch (error) {
-    console.error('Error updating inventory:', error);
-
-    const errorCode = error instanceof Error && 'code' in error 
-      ? (error as any).code 
-      : 'UNKNOWN';
-    
-    const isRetryable = error instanceof Error && 
-      'retryable' in error && 
-      (error as any).retryable;
-
-    const statusCodes: Record<string, number> = {
-      NOT_FOUND: 404,
-      INSUFFICIENT_STOCK: 409,
-      VERSION_CONFLICT: 409,
-      UNKNOWN: 500,
-    };
-
-    return NextResponse.json(
-      {
-        success: false,
-        error: error instanceof Error ? error.message : 'Failed to update inventory',
-        code: errorCode,
-        retryable: isRetryable,
-      },
-      { status: statusCodes[errorCode] || (isRetryable ? 503 : 500) }
-    );
+    return handleApiError(error);
   }
 }
 
 export async function POST(
   request: NextRequest,
-  { params }: RouteParams
-): Promise<NextResponse> {
+  { params }: { params: { vendorId: string } }
+) {
   try {
     const { vendorId } = params;
     const body = await request.json();
-    const { action } = body;
 
     if (!vendorId) {
-      return NextResponse.json(
-        { error: 'Vendor ID is required' },
-        { status: 400 }
-      );
+      return ApiResponseBuilder.badRequest('Vendor ID is required');
     }
 
-    if (action === 'sync') {
-      const result = await syncVendorInventory(vendorId);
-      
-      return NextResponse.json({
-        success: result.success,
-        data: result,
-        timestamp: new Date().toISOString(),
-      }, { status: result.success ? 200 : 207 }); // 207 Multi-Status for partial success
+    const validation = validateRequiredFields(body, ['productId', 'quantity']);
+    if (!validation.valid) {
+      return ApiResponseBuilder.badRequest('Missing required fields', {
+        missingFields: validation.missing,
+      });
     }
 
-    return NextResponse.json(
-      { error: 'Invalid action. Use: sync' },
-      { status: 400 }
-    );
+    const { productId, quantity, warehouseId, notes } = body;
+
+    if (typeof quantity !== 'number' || quantity < 0) {
+      return ApiResponseBuilder.badRequest('Quantity must be a non-negative number');
+    }
+
+    const inventoryItem = await inventoryService.updateStock(vendorId, productId, {
+      quantity,
+      warehouseId,
+      notes,
+      updatedBy: 'api', // In real app, get from auth context
+    });
+
+    return ApiResponseBuilder.success(inventoryItem);
   } catch (error) {
-    console.error('Error in inventory POST:', error);
+    return handleApiError(error);
+  }
+}
 
-    const isRetryable = error instanceof Error && 
-      'retryable' in error && 
-      (error as any).retryable;
+export async function PUT(
+  request: NextRequest,
+  { params }: { params: { vendorId: string } }
+) {
+  try {
+    const { vendorId } = params;
+    const body = await request.json();
 
-    return NextResponse.json(
-      {
-        success: false,
-        error: error instanceof Error ? error.message : 'Operation failed',
-        retryable: isRetryable,
-      },
-      { status: isRetryable ? 503 : 500 }
-    );
+    if (!vendorId) {
+      return ApiResponseBuilder.badRequest('Vendor ID is required');
+    }
+
+    const { updates } = body;
+
+    if (!Array.isArray(updates) || updates.length === 0) {
+      return ApiResponseBuilder.badRequest('Updates array is required');
+    }
+
+    if (updates.length > 100) {
+      return ApiResponseBuilder.badRequest('Maximum 100 items per batch update');
+    }
+
+    const results = await inventoryService.batchUpdateStock(vendorId, updates);
+
+    return ApiResponseBuilder.success({
+      successful: results.successful,
+      failed: results.failed,
+      totalProcessed: updates.length,
+    });
+  } catch (error) {
+    return handleApiError(error);
+  }
+}
+
+export async function DELETE(
+  request: NextRequest,
+  { params }: { params: { vendorId: string } }
+) {
+  try {
+    const { vendorId } = params;
+    const searchParams = request.nextUrl.searchParams;
+    const productId = searchParams.get('productId');
+
+    if (!vendorId) {
+      return ApiResponseBuilder.badRequest('Vendor ID is required');
+    }
+
+    if (!productId) {
+      return ApiResponseBuilder.badRequest('Product ID is required');
+    }
+
+    await inventoryService.removeFromInventory(vendorId, productId);
+
+    return ApiResponseBuilder.noContent();
+  } catch (error) {
+    return handleApiError(error);
   }
 }
