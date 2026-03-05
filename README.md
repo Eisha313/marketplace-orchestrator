@@ -4,4 +4,4 @@ A multi-vendor e-commerce platform with real-time inventory synchronization and 
 
 ## Updates
 
-Commit 36
+Commit 37
